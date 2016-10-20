@@ -167,9 +167,9 @@ typedef struct
  */
 typedef struct
 {
-#ifdef HAL_RADIO_INCLUDE_TIMESTAMP
+//#ifdef HAL_RADIO_INCLUDE_TIMESTAMP
     timer_tick_t timestamp; 	/**< The clock_tick of the framework timer at which the first bit of the sync word was received. */
-#endif
+//#endif
     hw_rx_cfg_t rx_cfg;		/**< The 'RX Configuration' used to receive the packet. */
     
     uint8_t lqi;		/**< The link quality indicator (LQI) reported by the radio for the received packet*/	
@@ -190,9 +190,9 @@ typedef struct
  */
 typedef struct
 {
-#ifdef HAL_RADIO_INCLUDE_TIMESTAMP
+//#ifdef HAL_RADIO_INCLUDE_TIMESTAMP
     timer_tick_t timestamp; 	/**< The clock_tick of the framework timer at which the first bit of the SFD was sent. */
-#endif
+//#endif
     hw_tx_cfg_t tx_cfg;		/**< The 'TX Configuration' used to receive the packet. */
     
 // TODO optimize struct for size. This was packed but resulted in alignment issues on Cortex-M0 so removed for now.

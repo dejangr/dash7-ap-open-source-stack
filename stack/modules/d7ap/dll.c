@@ -94,8 +94,8 @@ static bool NGDEF(_process_received_packets_after_tx);
 static bool NGDEF(_resume_fg_scan);
 #define resume_fg_scan NG(_resume_fg_scan)
 
-static timer_tick_t NGDEF(_tc_starting_time);
-#define tc_starting_time NG(_tc_starting_time)
+static bool NGDEF(_start_auto_scan);
+#define start_auto_scan NG(_start_auto_scan)
 
 // TODO defined somewhere?
 #define t_g	5
@@ -223,6 +223,21 @@ static bool is_tx_busy()
     }
 }
 
+static void discard_tx()
+{
+    if ((dll_state == DLL_STATE_CCA1) || (dll_state == DLL_STATE_CCA2))
+    {
+        timer_cancel_task(&execute_cca);
+        sched_cancel_task(&execute_cca);
+    }
+    else if ((dll_state == DLL_STATE_CCA_FAIL) || (dll_state == DLL_STATE_CSMA_CA_RETRY))
+    {
+        timer_cancel_task(&execute_csma_ca);
+        sched_cancel_task(&execute_csma_ca);
+    }
+    switch_state(DLL_STATE_IDLE);
+}
+
 static void process_received_packets()
 {
     if(is_tx_busy())
@@ -252,8 +267,6 @@ void packet_received(hw_radio_packet_t* hw_radio_packet)
     DPRINT("packet received @ %i , RSSI = %i", hw_radio_packet->rx_meta.timestamp, hw_radio_packet->rx_meta.rssi);
     packet_queue_mark_received(hw_radio_packet);
 
-    packet_t* packet = packet_queue_find_packet(hw_radio_packet);
-
     /* the received packet needs to be handled in priority */
     sched_post_task_prio(&process_received_packets, MAX_PRIORITY);
 }
@@ -265,7 +278,11 @@ static void packet_transmitted(hw_radio_packet_t* hw_radio_packet)
     DPRINT("Transmitted packet with length = %i", hw_radio_packet->length);
     packet_t* packet = packet_queue_find_packet(hw_radio_packet);
 
-    d7anp_signal_packet_transmitted(packet);
+    /* If the start_auto_scan flag is set, it is likely because the session
+     * expired. No need to signal that the packet is transmitted in such condition
+     */
+    if (!start_auto_scan)
+        d7anp_signal_packet_transmitted(packet);
 
     if(process_received_packets_after_tx)
     {
@@ -273,25 +290,6 @@ static void packet_transmitted(hw_radio_packet_t* hw_radio_packet)
         process_received_packets_after_tx = false;
     }
 
-#ifdef RESPONDER_USE_FG_SCAN_OUTSIDE_TRANSACTION // TODO validate if still needed, if yes: needs to be tested
-    /*
-     * Resume the FG scan only after an unicast packet, otherwise, wait the
-     * response period expiration.
-     */
-    if (resume_fg_scan && packet->dll_header.control_target_address_set)
-    {
-        switch_state(DLL_STATE_FOREGROUND_SCAN);
-
-        hw_rx_cfg_t rx_cfg = (hw_rx_cfg_t){
-            .channel_id.channel_header = current_access_profile->subbands[0].channel_header,
-            .channel_id.center_freq_index = current_access_profile->subbands[0].channel_index_start,
-            .syncword_class = PHY_SYNCWORD_CLASS1,
-        };
-
-        hw_radio_set_rx(&rx_cfg, &packet_received, NULL);
-        resume_fg_scan = false;
-    }
-#else
     if (resume_fg_scan)
     {
         switch_state(DLL_STATE_FOREGROUND_SCAN);
@@ -305,8 +303,11 @@ static void packet_transmitted(hw_radio_packet_t* hw_radio_packet)
         hw_radio_set_rx(&rx_cfg, &packet_received, NULL);
         resume_fg_scan = false;
     }
-#endif
-
+    else if (start_auto_scan)
+    {
+        dll_execute_scan_automation();
+        start_auto_scan = false;
+    }
 }
 
 static void cca_rssi_valid(int16_t cur_rssi)
@@ -326,6 +327,8 @@ static void cca_rssi_valid(int16_t cur_rssi)
         }
         else if(dll_state == DLL_STATE_CCA2)
         {
+            bool backup_flag = resume_fg_scan;
+
             // OK, send packet
             DPRINT("CCA2 RSSI: %d", cur_rssi);
             DPRINT("CCA2 succeeded, transmitting ...");
@@ -337,7 +340,10 @@ static void cca_rssi_valid(int16_t cur_rssi)
             error_t err = hw_radio_send_packet(&current_packet->hw_radio_packet, &packet_transmitted);
             assert(err == SUCCESS);
 
-            if (!resume_fg_scan)
+            /* if the 'packet_transmitted' callback is invoked before this task is terminated, the resume_fg_scan
+             * is likely modified. So, it is safer to take into account the backup of this flag
+             */
+            if (!backup_flag)
                 hw_radio_set_idle(); // ensure radio goes back to IDLE after transmission instead of to RX
             return;
         }
@@ -398,14 +404,12 @@ static void execute_csma_ca()
             dll_cca_started = timer_get_counter_value();
             DPRINT("Tca= %i = %i - %i", dll_tca, Tc, tx_duration);
 
-#ifndef FRAMEWORK_TIMER_RESET_COUNTER
-            // Adjust TCA value according the time already elapsed in the response period
-            if (tc_starting_time) // TODO how do manage tc_starting_time? not set for now
+            // Adjust TCA value according the time already elapsed since the reception time in case of response
+            if (current_packet->d7atp_ctrl.ctrl_tc == false)
             {
-                dll_tca -= dll_cca_started - tc_starting_time;
-                DPRINT("Adjusted Tca= %i = %i - %i", dll_tca, dll_cca_started, tc_starting_time);
+                dll_tca -= dll_cca_started - current_packet->hw_radio_packet.rx_meta.timestamp;
+                DPRINT("Adjusted Tca= %i = %i - %i", dll_tca, dll_cca_started, current_packet->hw_radio_packet.rx_meta.timestamp);
             }
-#endif
 
             if (dll_tca <= 0)
             {
@@ -618,9 +622,6 @@ void dll_init()
     hw_radio_init(&alloc_new_packet, &release_packet);
 
     dll_state = DLL_STATE_IDLE;
-#ifndef FRAMEWORK_TIMER_RESET_COUNTER
-    tc_starting_time = 0;
-#endif
     active_access_class = NO_ACTIVE_ACCESS_CLASS;
     process_received_packets_after_tx = false;
     resume_fg_scan = false;
@@ -636,20 +637,6 @@ void dll_tx_frame(packet_t* packet, dae_access_profile_t* access_profile)
     }
     else
         resume_fg_scan = true;
-
-#ifdef RESPONDER_USE_FG_SCAN_OUTSIDE_TRANSACTION
-    /*
-     * In case of broadcast request, it may be reasonable for power saving
-     * consideration to not perform the FG scan outside the transaction period.
-     * For that purpose, we decide to force the radio to go back to IDLE after
-     * starting TX from RX state.
-     * The FG scan will be resumed when the response period expires.
-     * With this procedure, we are not able to sniff any other concurrent responses
-     */
-    if (resume_fg_scan && !packet->dll_header.control_target_address_set)
-        hw_radio_set_idle();
-#endif
-
 
     current_access_profile = access_profile;
     dll_header_t* dll_header = &(packet->dll_header);
@@ -698,12 +685,27 @@ void dll_start_foreground_scan()
     hw_radio_set_rx(&rx_cfg, &packet_received, NULL);
 }
 
-void dll_stop_foreground_scan()
+void dll_stop_foreground_scan(bool auto_scan)
 {
-    assert(dll_state == DLL_STATE_FOREGROUND_SCAN);
-    DPRINT("Stopping FG scan");
+    if(is_tx_busy())
+    {
+        if (dll_state == DLL_STATE_TX_FOREGROUND)
+        {
+            /* start the autoscan when the Tx callback is invoked */
+            start_auto_scan = true;
+            return;
+        }
+        else
+            discard_tx();
+    }
+    else
+        assert(dll_state == DLL_STATE_FOREGROUND_SCAN);
 
-    dll_execute_scan_automation();
+    DPRINT("Stopping FG scan");
+    if (auto_scan)
+        dll_execute_scan_automation();
+    else
+        hw_radio_set_idle();
 }
 
 uint8_t dll_assemble_packet_header(packet_t* packet, uint8_t* data_ptr)
